@@ -11,3 +11,16 @@ sudo udevadm control --reload-rules
 sudo udevadm trigger
 
 # Logout and login again for group change to take effect
+
+To use these scripts:
+
+First, test basic connectivity:
+bash
+python3 test_connection.py /dev/ttyUSB0
+Run diagnostics to understand the frame format:
+bash
+python3 imu_diagnostic.py /dev/ttyUSB0
+Use the no-CRC version to start logging data:
+bash
+python3 imu_reader_nocrc.py
+The no-CRC version should work immediately and start displaying your IMU data. Once we understand the exact CRC algorithm from the diagnostic output, we can update the main reader with proper CRC verification.
