@@ -1,14 +1,22 @@
 import serial
+import configparser
 
 class SP2520Controller:
-    def __init__(self, port='/dev/ttyUSB1', baudrate=2400, address=1):
-        self.address = address
-        self.pan_speed = 0x20
-        self.tilt_speed = 0x20
+    def __init__(self, config_file='config.ini'):
+        # Read configuration
+        self.config = configparser.ConfigParser()
+        self.config.read(config_file)
+        
+        # Get SP2520 configuration
+        self.port = self.config.get('SP2520', 'port')
+        self.baudrate = self.config.getint('SP2520', 'baudrate')
+        self.address = self.config.getint('SP2520', 'address')
+        self.pan_speed = self.config.getint('SP2520', 'pan_speed')
+        self.tilt_speed = self.config.getint('SP2520', 'tilt_speed')
         
         self.serial = serial.Serial(
-            port=port,
-            baudrate=baudrate,
+            port=self.port,
+            baudrate=self.baudrate,
             bytesize=8,
             parity=serial.PARITY_NONE,
             stopbits=serial.STOPBITS_ONE,
@@ -63,5 +71,3 @@ class SP2520Controller:
         if self.serial and self.serial.is_open:
             self.stop()
             self.serial.close()
-
-    
