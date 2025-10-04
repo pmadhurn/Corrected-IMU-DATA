@@ -405,5 +405,51 @@ def main():
     except KeyboardInterrupt:
         reader.stop()
 
+def parse_data_flexible(self, data, data_length):
+    """Parse data flexibly based on actual length"""
+    parsed = {}
+    offset = 0
+    
+    # Add debug output to see byte positions
+    if self.debug:
+        print(f"\n=== PARSING {data_length} BYTES ===")
+        print(f"Raw hex: {data.hex()}")
+    
+    try:
+        for field_name, field_size, field_type in self.field_definitions:
+            if offset + field_size > data_length:
+                break
+            
+            # Debug: show what we're reading
+            if self.debug:
+                chunk = data[offset:offset+field_size]
+                print(f"Offset {offset:3d}: {field_name:12s} ({field_size} bytes) = {chunk.hex()}")
+            
+            if field_type == 'raw':
+                if field_name == 'utc':
+                    utc_data = data[offset:offset+field_size]
+                    parsed['utc_year'] = struct.unpack('<H', utc_data[0:2])[0]
+                    parsed['utc_month'] = utc_data[2]
+                    parsed['utc_day'] = utc_data[3]
+                    parsed['utc_hour'] = utc_data[4]
+                    parsed['utc_minute'] = utc_data[5]
+                    parsed['utc_second'] = utc_data[6]
+                else:
+                    parsed[field_name] = data[offset:offset+field_size]
+            else:
+                value = struct.unpack(f'<{field_type}', data[offset:offset+field_size])[0]
+                parsed[field_name] = value
+                
+                # Debug: show parsed value
+                if self.debug:
+                    print(f"         -> Value: {value}")
+            
+            offset += field_size
+        
+        # Specific debug for barometric altitude
+        if 'baro_alt' in parsed and self.debug:
+            print(f"\n!!! BARO_ALT raw value: {parsed['baro_alt']}")
+            print(f"!!! BARO_ALT converted: {parsed['baro_alt']/100.0:.2f}m")
+
 if __name__ == "__main__":
     main()

@@ -64,7 +64,9 @@ class IMUDiagnostic:
     
     def analyze_frame(self, data_buffer, start_pos):
         """Analyze a single frame structure"""
-        print("\nAnalyzing frame structure:")
+        print("\n" + "="*60)
+        print("FRAME STRUCTURE ANALYSIS")
+        print("="*60)
         
         # Extract frame components
         sync = data_buffer[start_pos]
@@ -78,7 +80,7 @@ class IMUDiagnostic:
         print(f"  Sync: 0x{sync:02X}")
         print(f"  Start: 0x{start:02X}")
         print(f"  CMD: 0x{cmd:02X}")
-        print(f"  Length: {data_length} (0x{len_msb:02X} 0x{len_lsb:02X})")
+        print(f"  Length: {data_length} bytes (0x{len_msb:02X} 0x{len_lsb:02X})")
         
         if start_pos + 5 + data_length + 3 <= len(data_buffer):
             data = data_buffer[start_pos + 5:start_pos + 5 + data_length]
@@ -91,22 +93,189 @@ class IMUDiagnostic:
             print(f"  CRC: 0x{received_crc:04X}")
             print(f"  End: 0x{end_byte:02X}")
             
+            # Show complete hex dump
+            print(f"\n  Complete frame hex ({len(data)} bytes):")
+            for i in range(0, len(data), 16):
+                hex_str = ' '.join(f'{b:02x}' for b in data[i:i+16])
+                print(f"    {i:04d}: {hex_str}")
+            
+            # Detailed field analysis
+            self.analyze_all_fields(data)
+            
             # Test different CRC calculations
             self.test_crc_methods(cmd, len_msb, len_lsb, data, received_crc)
-            
-            # Show first few data values
-            print("\nFirst few data values:")
-            for i in range(min(12, len(data))):
-                if i % 4 == 0:
-                    try:
-                        float_val = struct.unpack('<f', data[i:i+4])[0]
-                        print(f"  Offset {i:3d}: {float_val:10.6f} (float)")
-                    except:
-                        pass
     
+    def analyze_all_fields(self, data):
+        """Analyze all expected fields"""
+        print("\n" + "="*60)
+        print("FIELD-BY-FIELD ANALYSIS")
+        print("="*60)
+        
+        # Based on 106 bytes, some fields are missing
+        # Let's parse what we CAN identify
+        
+        offset = 0
+        
+        # Euler angles (12 bytes) - Usually always present
+        if offset + 12 <= len(data):
+            roll = struct.unpack('<f', data[offset:offset+4])[0]
+            pitch = struct.unpack('<f', data[offset+4:offset+8])[0]
+            yaw = struct.unpack('<f', data[offset+8:offset+12])[0]
+            print(f"\n[{offset:3d}-{offset+11:3d}] EULER ANGLES (12 bytes):")
+            print(f"  Roll:  {roll:.6f} rad = {roll*180/3.14159:.2f}°")
+            print(f"  Pitch: {pitch:.6f} rad = {pitch*180/3.14159:.2f}°")
+            print(f"  Yaw:   {yaw:.6f} rad = {yaw*180/3.14159:.2f}°")
+            offset += 12
+        
+        # Gyroscope (12 bytes)
+        if offset + 12 <= len(data):
+            gx = struct.unpack('<f', data[offset:offset+4])[0]
+            gy = struct.unpack('<f', data[offset+4:offset+8])[0]
+            gz = struct.unpack('<f', data[offset+8:offset+12])[0]
+            print(f"\n[{offset:3d}-{offset+11:3d}] GYROSCOPE (12 bytes):")
+            print(f"  Gx: {gx:.6f} rad/s")
+            print(f"  Gy: {gy:.6f} rad/s")
+            print(f"  Gz: {gz:.6f} rad/s")
+            offset += 12
+        
+        # Accelerometer (12 bytes)
+        if offset + 12 <= len(data):
+            ax = struct.unpack('<f', data[offset:offset+4])[0]
+            ay = struct.unpack('<f', data[offset+4:offset+8])[0]
+            az = struct.unpack('<f', data[offset+8:offset+12])[0]
+            print(f"\n[{offset:3d}-{offset+11:3d}] ACCELEROMETER (12 bytes):")
+            print(f"  Ax: {ax:.6f} m/s²")
+            print(f"  Ay: {ay:.6f} m/s²")
+            print(f"  Az: {az:.6f} m/s²")
+            offset += 12
+        
+        # Magnetometer (12 bytes)
+        if offset + 12 <= len(data):
+            mx = struct.unpack('<f', data[offset:offset+4])[0]
+            my = struct.unpack('<f', data[offset+4:offset+8])[0]
+            mz = struct.unpack('<f', data[offset+8:offset+12])[0]
+            print(f"\n[{offset:3d}-{offset+11:3d}] MAGNETOMETER (12 bytes):")
+            print(f"  Mx: {mx:.6f} µT")
+            print(f"  My: {my:.6f} µT")
+            print(f"  Mz: {mz:.6f} µT")
+            offset += 12
+        
+        # Now we're at byte 48
+        # Check if temperatures are present (8 bytes) or skipped
+        print(f"\n[{offset:3d}-???] REMAINING {len(data)-offset} BYTES")
+        print("Testing different field combinations...\n")
+        
+        # Test scenario 1: Temperatures present (T0, T1 = 8 bytes)
+        print("SCENARIO 1: With Temperatures (T0, T1)")
+        test_offset = offset
+        if test_offset + 8 <= len(data):
+            t0 = struct.unpack('<f', data[test_offset:test_offset+4])[0]
+            t1 = struct.unpack('<f', data[test_offset+4:test_offset+8])[0]
+            print(f"  [{test_offset:3d}-{test_offset+7:3d}] T0: {t0:.2f}°C, T1: {t1:.2f}°C")
+            test_offset += 8
+            self.test_remaining_fields(data, test_offset, "with temps")
+        
+        # Test scenario 2: Skip temperatures
+        print("\nSCENARIO 2: Without Temperatures")
+        test_offset = offset
+        self.test_remaining_fields(data, test_offset, "without temps")
+    
+    def test_remaining_fields(self, data, offset, scenario):
+        """Test parsing remaining fields"""
+        
+        # Time (4 bytes)
+        if offset + 4 <= len(data):
+            time_val = struct.unpack('<I', data[offset:offset+4])[0]
+            print(f"  [{offset:3d}-{offset+3:3d}] Time: {time_val}")
+            offset += 4
+        
+        # iTOW (4 bytes)
+        if offset + 4 <= len(data):
+            itow = struct.unpack('<I', data[offset:offset+4])[0]
+            print(f"  [{offset:3d}-{offset+3:3d}] iTOW: {itow} ms")
+            offset += 4
+        
+        # GPS Flags + numSV (2 bytes)
+        if offset + 2 <= len(data):
+            gps_flags = data[offset]
+            num_sv = data[offset+1]
+            fix_type = gps_flags & 0x03
+            fix_str = ["NO_FIX", "TIME_ONLY", "2D_FIX", "3D_FIX"][fix_type]
+            print(f"  [{offset:3d}-{offset+1:3d}] GPS: {fix_str}, Satellites: {num_sv}")
+            offset += 2
+        
+        # BARO_Alt (4 bytes) - THE PROBLEMATIC FIELD
+        if offset + 4 <= len(data):
+            raw_bytes = data[offset:offset+4]
+            baro_alt_int = struct.unpack('<i', raw_bytes)[0]
+            baro_alt_float = struct.unpack('<f', raw_bytes)[0]
+            print(f"  [{offset:3d}-{offset+3:3d}] BARO_Alt (hex: {raw_bytes.hex()}):")
+            print(f"    As int32: {baro_alt_int} -> {baro_alt_int/100.0:.2f}m")
+            print(f"    As float: {baro_alt_float:.2f}m")
+            
+            # Highlight reasonable values
+            if -100 < baro_alt_int/100.0 < 10000:
+                print(f"    ✓ REASONABLE as int32/100")
+            if -100 < baro_alt_float < 10000:
+                print(f"    ✓ REASONABLE as float")
+            
+            offset += 4
+        
+        # BARO_P (4 bytes)
+        if offset + 4 <= len(data):
+            baro_p = struct.unpack('<f', data[offset:offset+4])[0]
+            print(f"  [{offset:3d}-{offset+3:3d}] BARO_P: {baro_p:.2f} Pa")
+            offset += 4
+        
+        # Position (24 bytes: Lat, Long, Alt)
+        if offset + 24 <= len(data):
+            lat = struct.unpack('<d', data[offset:offset+8])[0]
+            lon = struct.unpack('<d', data[offset+8:offset+16])[0]
+            alt = struct.unpack('<d', data[offset+16:offset+24])[0]
+            print(f"  [{offset:3d}-{offset+23:3d}] Position:")
+            print(f"    Lat: {lat:.6f}°")
+            print(f"    Lon: {lon:.6f}°")
+            print(f"    Alt: {alt:.2f}m")
+            offset += 24
+        
+        # Velocity (12 bytes)
+        if offset + 12 <= len(data):
+            vel_n = struct.unpack('<f', data[offset:offset+4])[0]
+            vel_e = struct.unpack('<f', data[offset+4:offset+8])[0]
+            vel_d = struct.unpack('<f', data[offset+8:offset+12])[0]
+            print(f"  [{offset:3d}-{offset+11:3d}] Velocity: N={vel_n:.2f}, E={vel_e:.2f}, D={vel_d:.2f} m/s")
+            offset += 12
+        
+        # UTC (7 bytes) - if present
+        if offset + 7 <= len(data):
+            utc_year = struct.unpack('<H', data[offset:offset+2])[0]
+            utc_month = data[offset+2]
+            utc_day = data[offset+3]
+            utc_hour = data[offset+4]
+            utc_min = data[offset+5]
+            utc_sec = data[offset+6]
+            print(f"  [{offset:3d}-{offset+6:3d}] UTC: {utc_year}-{utc_month:02d}-{utc_day:02d} {utc_hour:02d}:{utc_min:02d}:{utc_sec:02d}")
+            offset += 7
+        
+        # Heading (4 bytes)
+        if offset + 4 <= len(data):
+            heading = struct.unpack('<f', data[offset:offset+4])[0]
+            print(f"  [{offset:3d}-{offset+3:3d}] Heading: {heading:.2f}°")
+            offset += 4
+        
+        # Summary
+        bytes_used = offset
+        bytes_remaining = len(data) - offset
+        print(f"\n  Scenario '{scenario}': Used {bytes_used}/{len(data)} bytes, {bytes_remaining} remaining")
+        
+        if bytes_remaining == 0:
+            print(f"  ✓✓✓ PERFECT MATCH! All bytes accounted for.")
+        
     def test_crc_methods(self, cmd, len_msb, len_lsb, data, received_crc):
         """Test various CRC calculation methods"""
-        print("\nTesting CRC methods:")
+        print("\n" + "="*60)
+        print("CRC VERIFICATION")
+        print("="*60)
         
         # Different CRC polynomials and methods
         def crc16_modbus(data):
@@ -152,15 +321,21 @@ class IMUDiagnostic:
             ("Length + Data", bytes([len_msb, len_lsb]) + data),
         ]
         
+        print(f"Received CRC: 0x{received_crc:04X}\n")
+        
         for name, test_data in tests:
             crc_modbus = crc16_modbus(test_data)
             crc_xmodem = crc16_xmodem(test_data)
             crc_ccitt = crc16_ccitt(test_data)
             
-            print(f"\n  {name}:")
-            print(f"    MODBUS: 0x{crc_modbus:04X} {'✓' if crc_modbus == received_crc else '✗'}")
-            print(f"    XMODEM: 0x{crc_xmodem:04X} {'✓' if crc_xmodem == received_crc else '✗'}")
-            print(f"    CCITT:  0x{crc_ccitt:04X} {'✓' if crc_ccitt == received_crc else '✗'}")
+            print(f"  {name}:")
+            match_modbus = "✓" if crc_modbus == received_crc else "✗"
+            match_xmodem = "✓" if crc_xmodem == received_crc else "✗"
+            match_ccitt = "✓" if crc_ccitt == received_crc else "✗"
+            
+            print(f"    MODBUS: 0x{crc_modbus:04X} {match_modbus}")
+            print(f"    XMODEM: 0x{crc_xmodem:04X} {match_xmodem}")
+            print(f"    CCITT:  0x{crc_ccitt:04X} {match_ccitt}")
     
     def capture_raw_frames(self, count=10):
         """Capture and save raw frames"""
