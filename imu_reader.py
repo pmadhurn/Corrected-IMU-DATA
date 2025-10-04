@@ -7,7 +7,7 @@ import time
 import threading
 from collections import deque
 
-class IMU560Reader:
+class IMU250Reader:
     def __init__(self, config_file='config.ini'):
         # Read configuration
         self.config = configparser.ConfigParser()
@@ -37,37 +37,20 @@ class IMU560Reader:
         # Debug mode
         self.debug = False
         
-        # Data structure offsets (in bytes)
-        self.data_offsets = {
-            'roll': 0,
-            'pitch': 4,
-            'yaw': 8,
-            'gx': 12,
-            'gy': 16,
-            'gz': 20,
-            'ax': 24,
-            'ay': 28,
-            'az': 32,
-            'mx': 36,
-            'my': 40,
-            'mz': 44,
-            't0': 48,
-            't1': 52,
-            'time': 56,
-            'iTOW': 60,
-            'gps_flags': 64,
-            'num_sv': 65,
-            'baro_alt': 66,
-            'baro_p': 70,
-            'lat': 74,
-            'long': 82,
-            'alt': 90,
-            'vel_n': 98,
-            'vel_e': 102,
-            'vel_d': 106,
-            'utc': 110,
-            'heading': 117
-        }
+        # Output mask flags (from IMU250 documentation)
+        self.OUTPUT_EULER = 0x00000001
+        self.OUTPUT_GYROSCOPES = 0x00000002
+        self.OUTPUT_ACCELEROMETERS = 0x00000004
+        self.OUTPUT_MAGNETOMETERS = 0x00000008
+        self.OUTPUT_TEMPERATURES = 0x00000010
+        self.OUTPUT_TIME_SINCE_RESET = 0x00000020
+        self.OUTPUT_GPS_INFO = 0x00000040
+        self.OUTPUT_BARO_ALTITUDE = 0x00000080
+        self.OUTPUT_BARO_PRESSURE = 0x00000100
+        self.OUTPUT_POSITION = 0x00000200
+        self.OUTPUT_VELOCITY = 0x00000400
+        self.OUTPUT_UTC_TIME = 0x00000800
+        self.OUTPUT_MAG_HEADING = 0x00001000
         
     def connect(self):
         """Establish serial connection"""
@@ -95,7 +78,7 @@ class IMU560Reader:
             print("Disconnected")
     
     def calculate_crc16_xmodem(self, data):
-        """Calculate CRC16-XMODEM (common for IMU devices)"""
+        """Calculate CRC16-XMODEM"""
         crc = 0x0000
         for byte in data:
             crc ^= byte << 8
@@ -108,7 +91,7 @@ class IMU560Reader:
         return crc
     
     def calculate_crc16_modbus(self, data):
-        """Calculate CRC16-MODBUS (alternative algorithm)"""
+        """Calculate CRC16-MODBUS"""
         crc = 0xFFFF
         for byte in data:
             crc ^= byte
@@ -158,7 +141,7 @@ class IMU560Reader:
         data_length = struct.unpack('>H', len_bytes)[0]
         
         if self.debug:
-            print(f"Data length: {data_length}")
+            print(f"\nData length: {data_length}")
         
         # Read data
         data = self.serial_port.read(data_length)
@@ -179,101 +162,144 @@ class IMU560Reader:
                 print(f"Invalid end byte: 0x{end_byte[0]:02X if end_byte else 0:02X}")
             return None
         
-        # Try different CRC calculations
+        # Verify CRC
         received_crc = struct.unpack('>H', crc_bytes)[0]
-        
-        # Include different parts of the frame in CRC calculation
-        # Method 1: Only data
-        crc1 = self.calculate_crc16_modbus(data)
-        
-        # Method 2: CMD + Length + Data
-        crc2 = self.calculate_crc16_modbus(cmd + len_bytes + data)
-        
-        # Method 3: Length + Data
-        crc3 = self.calculate_crc16_modbus(len_bytes + data)
-        
-        # Method 4: Using XMODEM algorithm
-        crc4 = self.calculate_crc16_xmodem(cmd + len_bytes + data)
+        calculated_crc = self.calculate_crc16_modbus(cmd + len_bytes + data)
         
         if self.debug:
-            print(f"Received CRC: 0x{received_crc:04X}")
-            print(f"CRC Method 1 (data only): 0x{crc1:04X}")
-            print(f"CRC Method 2 (cmd+len+data): 0x{crc2:04X}")
-            print(f"CRC Method 3 (len+data): 0x{crc3:04X}")
-            print(f"CRC Method 4 (xmodem): 0x{crc4:04X}")
+            print(f"Received CRC: 0x{received_crc:04X}, Calculated: 0x{calculated_crc:04X}")
         
-        # For now, skip CRC verification if none match
-        # You can enable strict CRC checking once we identify the correct method
-        if received_crc not in [crc1, crc2, crc3, crc4]:
-            if self.debug:
-                print("CRC mismatch - proceeding anyway")
-            # Uncomment below to enforce CRC checking
-            # return None
+        # For now, proceed even if CRC doesn't match (can be enabled later)
+        # if received_crc != calculated_crc:
+        #     return None
         
         return data
     
     def parse_data(self, data):
-        """Parse the data buffer according to IMU560 format"""
+        """Parse the data buffer according to IMU250 variable format"""
         parsed = {}
-        
-        # Expected data length is 121 bytes according to your documentation
-        if len(data) != 121:
-            if self.debug:
-                print(f"Warning: Data length is {len(data)}, expected 121")
+        offset = 0
         
         try:
-            # Attitude angles (Euler) - float32, radians
-            parsed['roll'] = struct.unpack('<f', data[self.data_offsets['roll']:self.data_offsets['roll']+4])[0]
-            parsed['pitch'] = struct.unpack('<f', data[self.data_offsets['pitch']:self.data_offsets['pitch']+4])[0]
-            parsed['yaw'] = struct.unpack('<f', data[self.data_offsets['yaw']:self.data_offsets['yaw']+4])[0]
+            # First, try to detect which fields are present by checking data length
+            # and attempting to parse accordingly
             
-            # Gyroscope data
-            parsed['gx'] = struct.unpack('<f', data[self.data_offsets['gx']:self.data_offsets['gx']+4])[0]
-            parsed['gy'] = struct.unpack('<f', data[self.data_offsets['gy']:self.data_offsets['gy']+4])[0]
-            parsed['gz'] = struct.unpack('<f', data[self.data_offsets['gz']:self.data_offsets['gz']+4])[0]
+            # Euler angles (Roll, Pitch, Yaw) - 12 bytes total (3 x float32)
+            if offset + 12 <= len(data):
+                parsed['roll'] = struct.unpack('<f', data[offset:offset+4])[0]
+                parsed['pitch'] = struct.unpack('<f', data[offset+4:offset+8])[0]
+                parsed['yaw'] = struct.unpack('<f', data[offset+8:offset+12])[0]
+                offset += 12
+                parsed['has_euler'] = True
+            else:
+                return None  # Minimum data should include Euler angles
             
-            # Accelerometer data
-            parsed['ax'] = struct.unpack('<f', data[self.data_offsets['ax']:self.data_offsets['ax']+4])[0]
-            parsed['ay'] = struct.unpack('<f', data[self.data_offsets['ay']:self.data_offsets['ay']+4])[0]
-            parsed['az'] = struct.unpack('<f', data[self.data_offsets['az']:self.data_offsets['az']+4])[0]
+            # Gyroscope data (Gx, Gy, Gz) - 12 bytes
+            if offset + 12 <= len(data):
+                parsed['gx'] = struct.unpack('<f', data[offset:offset+4])[0]
+                parsed['gy'] = struct.unpack('<f', data[offset+4:offset+8])[0]
+                parsed['gz'] = struct.unpack('<f', data[offset+8:offset+12])[0]
+                offset += 12
+                parsed['has_gyro'] = True
             
-            # GPS Info
-            parsed['iTOW'] = struct.unpack('<I', data[self.data_offsets['iTOW']:self.data_offsets['iTOW']+4])[0]
-            parsed['gps_flags'] = data[self.data_offsets['gps_flags']]
-            parsed['num_sv'] = data[self.data_offsets['num_sv']]
+            # Accelerometer data (Ax, Ay, Az) - 12 bytes
+            if offset + 12 <= len(data):
+                parsed['ax'] = struct.unpack('<f', data[offset:offset+4])[0]
+                parsed['ay'] = struct.unpack('<f', data[offset+4:offset+8])[0]
+                parsed['az'] = struct.unpack('<f', data[offset+8:offset+12])[0]
+                offset += 12
+                parsed['has_accel'] = True
             
-            # Barometric altitude - int32, cm
-            parsed['baro_alt'] = struct.unpack('<i', data[self.data_offsets['baro_alt']:self.data_offsets['baro_alt']+4])[0]
+            # Magnetometer data (Mx, My, Mz) - 12 bytes
+            if offset + 12 <= len(data):
+                parsed['mx'] = struct.unpack('<f', data[offset:offset+4])[0]
+                parsed['my'] = struct.unpack('<f', data[offset+4:offset+8])[0]
+                parsed['mz'] = struct.unpack('<f', data[offset+8:offset+12])[0]
+                offset += 12
+                parsed['has_mag'] = True
             
-            # Position - double (float64), degrees and meters
-            parsed['lat'] = struct.unpack('<d', data[self.data_offsets['lat']:self.data_offsets['lat']+8])[0]
-            parsed['long'] = struct.unpack('<d', data[self.data_offsets['long']:self.data_offsets['long']+8])[0]
-            parsed['alt'] = struct.unpack('<d', data[self.data_offsets['alt']:self.data_offsets['alt']+8])[0]
+            # Temperature data (T0, T1) - 8 bytes
+            if offset + 8 <= len(data):
+                parsed['t0'] = struct.unpack('<f', data[offset:offset+4])[0]
+                parsed['t1'] = struct.unpack('<f', data[offset+4:offset+8])[0]
+                offset += 8
+                parsed['has_temp'] = True
             
-            # UTC Time
-            utc_data = data[self.data_offsets['utc']:self.data_offsets['utc']+7]
-            parsed['utc_year'] = struct.unpack('<H', utc_data[0:2])[0]
-            parsed['utc_month'] = utc_data[2]
-            parsed['utc_day'] = utc_data[3]
-            parsed['utc_hour'] = utc_data[4]
-            parsed['utc_minute'] = utc_data[5]
-            parsed['utc_second'] = utc_data[6]
+            # Time since reset - 4 bytes
+            if offset + 4 <= len(data):
+                parsed['time'] = struct.unpack('<I', data[offset:offset+4])[0]
+                offset += 4
+                parsed['has_time'] = True
             
-            # Magnetic heading - float32, degrees
-            parsed['heading'] = struct.unpack('<f', data[self.data_offsets['heading']:self.data_offsets['heading']+4])[0]
+            # GPS Info (iTOW, flags, numSV) - 6 bytes
+            if offset + 6 <= len(data):
+                parsed['iTOW'] = struct.unpack('<I', data[offset:offset+4])[0]
+                parsed['gps_flags'] = data[offset+4]
+                parsed['num_sv'] = data[offset+5]
+                offset += 6
+                parsed['has_gps_info'] = True
+                
+                # Parse GPS flags
+                gps_fix_type = parsed['gps_flags'] & 0x03
+                parsed['gps_fix_string'] = self.get_gps_fix_string(gps_fix_type)
+                parsed['gps_valid_tow'] = bool(parsed['gps_flags'] & 0x04)
+                parsed['gps_valid_wkn'] = bool(parsed['gps_flags'] & 0x08)
+                parsed['gps_valid_utc'] = bool(parsed['gps_flags'] & 0x10)
+                parsed['gps_true_heading_valid'] = bool(parsed['gps_flags'] & 0x20)
             
-            # GPS status parsing
-            gps_fix_type = parsed['gps_flags'] & 0x03
-            parsed['gps_fix_string'] = self.get_gps_fix_string(gps_fix_type)
-            parsed['gps_valid_tow'] = bool(parsed['gps_flags'] & 0x04)
-            parsed['gps_valid_wkn'] = bool(parsed['gps_flags'] & 0x08)
-            parsed['gps_valid_utc'] = bool(parsed['gps_flags'] & 0x10)
-            parsed['gps_true_heading_valid'] = bool(parsed['gps_flags'] & 0x20)
+            # Barometric altitude - 4 bytes (int32, cm)
+            if offset + 4 <= len(data):
+                parsed['baro_alt'] = struct.unpack('<i', data[offset:offset+4])[0]
+                offset += 4
+                parsed['has_baro_alt'] = True
             
+            # Barometric pressure - 4 bytes (float32)
+            if offset + 4 <= len(data):
+                parsed['baro_p'] = struct.unpack('<f', data[offset:offset+4])[0]
+                offset += 4
+                parsed['has_baro_p'] = True
+            
+            # Position (Lat, Long, Alt) - 24 bytes (3 x double/float64)
+            if offset + 24 <= len(data):
+                parsed['lat'] = struct.unpack('<d', data[offset:offset+8])[0]
+                parsed['long'] = struct.unpack('<d', data[offset+8:offset+16])[0]
+                parsed['alt'] = struct.unpack('<d', data[offset+16:offset+24])[0]
+                offset += 24
+                parsed['has_position'] = True
+            
+            # Velocity (VelN, VelE, VelD) - 12 bytes
+            if offset + 12 <= len(data):
+                parsed['vel_n'] = struct.unpack('<f', data[offset:offset+4])[0]
+                parsed['vel_e'] = struct.unpack('<f', data[offset+4:offset+8])[0]
+                parsed['vel_d'] = struct.unpack('<f', data[offset+8:offset+12])[0]
+                offset += 12
+                parsed['has_velocity'] = True
+            
+            # UTC Time - 7 bytes
+            if offset + 7 <= len(data):
+                parsed['utc_year'] = struct.unpack('<H', data[offset:offset+2])[0]
+                parsed['utc_month'] = data[offset+2]
+                parsed['utc_day'] = data[offset+3]
+                parsed['utc_hour'] = data[offset+4]
+                parsed['utc_minute'] = data[offset+5]
+                parsed['utc_second'] = data[offset+6]
+                offset += 7
+                parsed['has_utc'] = True
+            
+            # Magnetic heading - 4 bytes (float32, degrees)
+            if offset + 4 <= len(data):
+                parsed['heading'] = struct.unpack('<f', data[offset:offset+4])[0]
+                offset += 4
+                parsed['has_heading'] = True
+            
+            if self.debug:
+                print(f"Parsed {offset} bytes out of {len(data)} total")
+                
         except Exception as e:
             if self.debug:
                 print(f"Error parsing data: {e}")
                 print(f"Data hex: {data.hex()}")
+                print(f"Offset: {offset}, Data length: {len(data)}")
             return None
         
         return parsed
@@ -292,23 +318,71 @@ class IMU560Reader:
         """Format parsed data into a log entry"""
         timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
         
-        # Convert radians to degrees for display
-        roll_deg = parsed_data['roll'] * 180.0 / 3.14159265359
-        pitch_deg = parsed_data['pitch'] * 180.0 / 3.14159265359
-        yaw_deg = parsed_data['yaw'] * 180.0 / 3.14159265359
+        log_parts = [timestamp]
         
-        log_entry = (
-            f"{timestamp},"
-            f"EULER(deg): R={roll_deg:.2f},P={pitch_deg:.2f},Y={yaw_deg:.2f},"
-            f"UTC: {parsed_data['utc_year']}-{parsed_data['utc_month']:02d}-{parsed_data['utc_day']:02d} "
-            f"{parsed_data['utc_hour']:02d}:{parsed_data['utc_minute']:02d}:{parsed_data['utc_second']:02d},"
-            f"MAG_HEADING: {parsed_data['heading']:.2f}°,"
-            f"BARO_ALT: {parsed_data['baro_alt']/100.0:.2f}m,"
-            f"GPS: {parsed_data['gps_fix_string']},SAT={parsed_data['num_sv']},iTOW={parsed_data['iTOW']}ms,"
-            f"POS: LAT={parsed_data['lat']:.6f},LON={parsed_data['long']:.6f},ALT={parsed_data['alt']:.2f}m"
-        )
+        # Euler angles
+        if parsed_data.get('has_euler'):
+            roll_deg = parsed_data['roll'] * 180.0 / 3.14159265359
+            pitch_deg = parsed_data['pitch'] * 180.0 / 3.14159265359
+            yaw_deg = parsed_data['yaw'] * 180.0 / 3.14159265359
+            log_parts.append(f"EULER(deg): R={roll_deg:.2f},P={pitch_deg:.2f},Y={yaw_deg:.2f}")
         
-        return log_entry
+        # Gyroscope
+        if parsed_data.get('has_gyro'):
+            log_parts.append(f"GYRO(rad/s): X={parsed_data['gx']:.4f},Y={parsed_data['gy']:.4f},Z={parsed_data['gz']:.4f}")
+        
+        # Accelerometer
+        if parsed_data.get('has_accel'):
+            log_parts.append(f"ACCEL(m/s²): X={parsed_data['ax']:.4f},Y={parsed_data['ay']:.4f},Z={parsed_data['az']:.4f}")
+        
+        # Magnetometer
+        if parsed_data.get('has_mag'):
+            log_parts.append(f"MAG(Gauss): X={parsed_data['mx']:.4f},Y={parsed_data['my']:.4f},Z={parsed_data['mz']:.4f}")
+        
+        # Temperature
+        if parsed_data.get('has_temp'):
+            log_parts.append(f"TEMP(°C): T0={parsed_data['t0']:.2f},T1={parsed_data['t1']:.2f}")
+        
+        # Time since reset
+        if parsed_data.get('has_time'):
+            log_parts.append(f"TIME_MS: {parsed_data['time']}")
+        
+        # UTC Time
+        if parsed_data.get('has_utc'):
+            log_parts.append(
+                f"UTC: {parsed_data['utc_year']}-{parsed_data['utc_month']:02d}-{parsed_data['utc_day']:02d} "
+                f"{parsed_data['utc_hour']:02d}:{parsed_data['utc_minute']:02d}:{parsed_data['utc_second']:02d}"
+            )
+        
+        # Magnetic heading
+        if parsed_data.get('has_heading'):
+            log_parts.append(f"MAG_HEADING: {parsed_data['heading']:.2f}°")
+        
+        # Barometric data
+        if parsed_data.get('has_baro_alt'):
+            log_parts.append(f"BARO_ALT: {parsed_data['baro_alt']/100.0:.2f}m")
+        if parsed_data.get('has_baro_p'):
+            log_parts.append(f"BARO_P: {parsed_data['baro_p']:.2f}Pa")
+        
+        # GPS info
+        if parsed_data.get('has_gps_info'):
+            log_parts.append(
+                f"GPS: {parsed_data['gps_fix_string']},SAT={parsed_data['num_sv']},iTOW={parsed_data['iTOW']}ms"
+            )
+        
+        # Position
+        if parsed_data.get('has_position'):
+            log_parts.append(
+                f"POS: LAT={parsed_data['lat']:.6f},LON={parsed_data['long']:.6f},ALT={parsed_data['alt']:.2f}m"
+            )
+        
+        # Velocity
+        if parsed_data.get('has_velocity'):
+            log_parts.append(
+                f"VEL(m/s): N={parsed_data['vel_n']:.2f},E={parsed_data['vel_e']:.2f},D={parsed_data['vel_d']:.2f}"
+            )
+        
+        return ",".join(log_parts)
     
     def write_log(self):
         """Write buffer to log file"""
@@ -332,11 +406,13 @@ class IMU560Reader:
                         frame_count += 1
                         
                         # Clear line and print
-                        print(f"\rFrames: {frame_count}, Errors: {error_count} | {log_entry[:100]}...", end='', flush=True)
+                        print(f"\rFrames: {frame_count}, Errors: {error_count} | {log_entry[:150]}...", end='', flush=True)
                         
                         # Write to file periodically (every 100 entries)
                         if len(self.data_buffer) % 100 == 0:
                             self.write_log()
+                    else:
+                        error_count += 1
                 else:
                     error_count += 1
                 
@@ -377,7 +453,7 @@ class IMU560Reader:
         print(f"\nDebug mode: {'ON' if self.debug else 'OFF'}")
 
 def main():
-    reader = IMU560Reader('config.ini')
+    reader = IMU250Reader('config.ini')
     
     # Check if we need to run in debug mode
     import sys
@@ -388,12 +464,6 @@ def main():
     try:
         if reader.start():
             while True:
-                # Non-blocking keyboard input check
-                import select
-                if select.select([sys.stdin], [], [], 0)[0]:
-                    key = sys.stdin.read(1)
-                    if key.lower() == 'd':
-                        reader.toggle_debug()
                 time.sleep(0.1)
     except KeyboardInterrupt:
         reader.stop()
