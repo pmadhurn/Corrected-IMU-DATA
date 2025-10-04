@@ -1,13 +1,13 @@
+#!/usr/bin/env python3
 import serial
 import struct
 import datetime
 import configparser
-import os
-import time
 import threading
+import time
 from collections import deque
 
-class IMU250Reader:
+class FlexibleIMUReader:
     def __init__(self, config_file='config.ini'):
         # Read configuration
         self.config = configparser.ConfigParser()
@@ -21,7 +21,7 @@ class IMU250Reader:
         self.log_file = self.config.get('Logging', 'log_file')
         self.max_entries = self.config.getint('Logging', 'max_entries')
         
-        # Data buffer for circular logging
+        # Data buffer
         self.data_buffer = deque(maxlen=self.max_entries)
         
         # Frame parameters
@@ -33,43 +33,12 @@ class IMU250Reader:
         # Serial connection
         self.serial_port = None
         self.running = False
-        
-        # Debug mode
         self.debug = False
         
-        # Define data field structure (field_name: size_in_bytes)
-        # These fields appear in order based on the mask
-        self.field_definitions = [
-            ('roll', 4, 'f'),      # float32
-            ('pitch', 4, 'f'),     # float32
-            ('yaw', 4, 'f'),       # float32
-            ('gx', 4, 'f'),        # float32
-            ('gy', 4, 'f'),        # float32
-            ('gz', 4, 'f'),        # float32
-            ('ax', 4, 'f'),        # float32
-            ('ay', 4, 'f'),        # float32
-            ('az', 4, 'f'),        # float32
-            ('mx', 4, 'f'),        # float32
-            ('my', 4, 'f'),        # float32
-            ('mz', 4, 'f'),        # float32
-            ('t0', 4, 'f'),        # float32
-            ('t1', 4, 'f'),        # float32
-            ('time', 4, 'I'),      # uint32
-            ('iTOW', 4, 'I'),      # uint32
-            ('gps_flags', 1, 'B'), # uint8
-            ('num_sv', 1, 'B'),    # uint8
-            ('baro_alt', 4, 'i'),  # int32
-            ('baro_p', 4, 'f'),    # float32
-            ('lat', 8, 'd'),       # double
-            ('long', 8, 'd'),      # double
-            ('alt', 8, 'd'),       # double
-            ('vel_n', 4, 'f'),     # float32
-            ('vel_e', 4, 'f'),     # float32
-            ('vel_d', 4, 'f'),     # float32
-            ('utc', 7, 'raw'),     # 7 bytes raw
-            ('heading', 4, 'f'),   # float32
-        ]
-        
+        # Auto-detected frame structure
+        self.frame_length = None
+        self.structure_detected = False
+    
     def connect(self):
         """Establish serial connection"""
         try:
@@ -81,7 +50,6 @@ class IMU250Reader:
                 stopbits=serial.STOPBITS_ONE,
                 timeout=1.0
             )
-            # Clear input buffer
             self.serial_port.reset_input_buffer()
             print(f"Connected to {self.port} at {self.baudrate} baud")
             return True
@@ -95,36 +63,11 @@ class IMU250Reader:
             self.serial_port.close()
             print("Disconnected")
     
-    def calculate_crc16_xmodem(self, data):
-        """Calculate CRC16-XMODEM"""
-        crc = 0x0000
-        for byte in data:
-            crc ^= byte << 8
-            for _ in range(8):
-                if crc & 0x8000:
-                    crc = (crc << 1) ^ 0x1021
-                else:
-                    crc <<= 1
-                crc &= 0xFFFF
-        return crc
-    
-    def calculate_crc16_modbus(self, data):
-        """Calculate CRC16-MODBUS"""
-        crc = 0xFFFF
-        for byte in data:
-            crc ^= byte
-            for _ in range(8):
-                if crc & 0x0001:
-                    crc = (crc >> 1) ^ 0xA001
-                else:
-                    crc >>= 1
-        return crc
-    
     def find_frame_start(self):
         """Find the start of a valid frame"""
         sync_search = bytearray()
         
-        while True:
+        while self.running:
             byte = self.serial_port.read(1)
             if not byte:
                 return False
@@ -135,135 +78,166 @@ class IMU250Reader:
             
             if len(sync_search) == 2 and sync_search[0] == self.SYNC_BYTE and sync_search[1] == self.START_BYTE:
                 return True
+        
+        return False
     
     def read_frame(self):
         """Read a complete frame from the serial port"""
         if not self.find_frame_start():
-            return None, 0
+            return None
         
         # Read CMD byte
         cmd = self.serial_port.read(1)
-        if not cmd:
-            return None, 0
-        
-        if cmd[0] != self.CMD_CONTINUOUS:
-            if self.debug:
-                print(f"Unexpected CMD: 0x{cmd[0]:02X}")
-            return None, 0
+        if not cmd or cmd[0] != self.CMD_CONTINUOUS:
+            return None
         
         # Read length (2 bytes, big endian)
         len_bytes = self.serial_port.read(2)
         if len(len_bytes) != 2:
-            return None, 0
+            return None
         
         data_length = struct.unpack('>H', len_bytes)[0]
         
-        if self.debug:
-            print(f"\nData length: {data_length}")
+        # Auto-detect frame length on first read
+        if not self.structure_detected:
+            self.frame_length = data_length
+            self.detect_structure(data_length)
         
         # Read data
         data = self.serial_port.read(data_length)
         if len(data) != data_length:
-            if self.debug:
-                print(f"Data length mismatch: expected {data_length}, got {len(data)}")
-            return None, 0
+            return None
         
-        # Read CRC (2 bytes)
+        # Read CRC (2 bytes) - we'll skip verification
         crc_bytes = self.serial_port.read(2)
         if len(crc_bytes) != 2:
-            return None, 0
+            return None
         
         # Read end byte
         end_byte = self.serial_port.read(1)
         if not end_byte or end_byte[0] != self.END_BYTE:
-            if self.debug:
-                print(f"Invalid end byte: 0x{end_byte[0]:02X if end_byte else 0:02X}")
-            return None, 0
+            return None
         
-        # Verify CRC
-        received_crc = struct.unpack('>H', crc_bytes)[0]
-        
-        # Try different CRC calculations
-        crc1 = self.calculate_crc16_modbus(data)
-        crc2 = self.calculate_crc16_modbus(cmd + len_bytes + data)
-        crc3 = self.calculate_crc16_modbus(len_bytes + data)
-        crc4 = self.calculate_crc16_xmodem(cmd + len_bytes + data)
-        
-        if self.debug:
-            print(f"Received CRC: 0x{received_crc:04X}")
-            print(f"CRC Method 1 (data only): 0x{crc1:04X}")
-            print(f"CRC Method 2 (cmd+len+data): 0x{crc2:04X}")
-            print(f"CRC Method 3 (len+data): 0x{crc3:04X}")
-            print(f"CRC Method 4 (xmodem): 0x{crc4:04X}")
-        
-        # Optional: Skip CRC verification in debug mode
-        if received_crc not in [crc1, crc2, crc3, crc4]:
-            if self.debug:
-                print("CRC mismatch - proceeding anyway")
-                print(f"Data hex: {data.hex()}")
-        
-        return data, data_length
+        return data
     
-    def parse_data_flexible(self, data, data_length):
-        """Parse data flexibly based on actual length"""
+    def detect_structure(self, data_length):
+        """Auto-detect which fields are present based on data length"""
+        self.structure_detected = True
+        
+        if data_length == 106:
+            print("✓ Detected 106-byte structure (without Temperatures and UTC)")
+            self.has_temperatures = False
+            self.has_utc = False
+        elif data_length == 114:
+            print("✓ Detected 114-byte structure (with Temperatures, without UTC)")
+            self.has_temperatures = True
+            self.has_utc = False
+        elif data_length == 121:
+            print("✓ Detected 121-byte structure (full, with Temperatures and UTC)")
+            self.has_temperatures = True
+            self.has_utc = True
+        else:
+            print(f"⚠ Unknown structure length: {data_length} bytes")
+            # Default to minimal structure
+            self.has_temperatures = False
+            self.has_utc = False
+    
+    def parse_data(self, data):
+        """Parse data based on detected structure"""
         parsed = {}
         offset = 0
         
         try:
-            # Parse fields in order until we run out of data
-            for field_name, field_size, field_type in self.field_definitions:
-                if offset + field_size > data_length:
-                    break
-                
-                if field_type == 'raw':
-                    # Special handling for UTC (7 bytes)
-                    if field_name == 'utc':
-                        utc_data = data[offset:offset+field_size]
-                        parsed['utc_year'] = struct.unpack('<H', utc_data[0:2])[0]
-                        parsed['utc_month'] = utc_data[2]
-                        parsed['utc_day'] = utc_data[3]
-                        parsed['utc_hour'] = utc_data[4]
-                        parsed['utc_minute'] = utc_data[5]
-                        parsed['utc_second'] = utc_data[6]
-                    else:
-                        parsed[field_name] = data[offset:offset+field_size]
-                else:
-                    # Unpack based on type
-                    value = struct.unpack(f'<{field_type}', data[offset:offset+field_size])[0]
-                    parsed[field_name] = value
-                
-                offset += field_size
+            # Euler angles (12 bytes) - Always present
+            parsed['roll'] = struct.unpack('<f', data[offset:offset+4])[0]
+            parsed['pitch'] = struct.unpack('<f', data[offset+4:offset+8])[0]
+            parsed['yaw'] = struct.unpack('<f', data[offset+8:offset+12])[0]
+            offset += 12
             
-            # Parse GPS flags if available
-            if 'gps_flags' in parsed:
-                gps_fix_type = parsed['gps_flags'] & 0x03
-                parsed['gps_fix_string'] = self.get_gps_fix_string(gps_fix_type)
-                parsed['gps_valid_tow'] = bool(parsed['gps_flags'] & 0x04)
-                parsed['gps_valid_wkn'] = bool(parsed['gps_flags'] & 0x08)
-                parsed['gps_valid_utc'] = bool(parsed['gps_flags'] & 0x10)
-                parsed['gps_true_heading_valid'] = bool(parsed['gps_flags'] & 0x20)
+            # Gyroscope (12 bytes) - Always present
+            parsed['gx'] = struct.unpack('<f', data[offset:offset+4])[0]
+            parsed['gy'] = struct.unpack('<f', data[offset+4:offset+8])[0]
+            parsed['gz'] = struct.unpack('<f', data[offset+8:offset+12])[0]
+            offset += 12
+            
+            # Accelerometer (12 bytes) - Always present
+            parsed['ax'] = struct.unpack('<f', data[offset:offset+4])[0]
+            parsed['ay'] = struct.unpack('<f', data[offset+4:offset+8])[0]
+            parsed['az'] = struct.unpack('<f', data[offset+8:offset+12])[0]
+            offset += 12
+            
+            # Magnetometer (12 bytes) - Always present
+            parsed['mx'] = struct.unpack('<f', data[offset:offset+4])[0]
+            parsed['my'] = struct.unpack('<f', data[offset+4:offset+8])[0]
+            parsed['mz'] = struct.unpack('<f', data[offset+8:offset+12])[0]
+            offset += 12
+            
+            # Temperatures (8 bytes) - Conditional
+            if self.has_temperatures:
+                parsed['t0'] = struct.unpack('<f', data[offset:offset+4])[0]
+                parsed['t1'] = struct.unpack('<f', data[offset+4:offset+8])[0]
+                offset += 8
+            
+            # Time (4 bytes)
+            parsed['time'] = struct.unpack('<I', data[offset:offset+4])[0]
+            offset += 4
+            
+            # iTOW (4 bytes)
+            parsed['iTOW'] = struct.unpack('<I', data[offset:offset+4])[0]
+            offset += 4
+            
+            # GPS flags + numSV (2 bytes)
+            parsed['gps_flags'] = data[offset]
+            parsed['num_sv'] = data[offset+1]
+            gps_fix_type = parsed['gps_flags'] & 0x03
+            parsed['gps_fix_string'] = ["NO_FIX", "TIME_ONLY", "2D_FIX", "3D_FIX"][gps_fix_type]
+            offset += 2
+            
+            # BARO_Alt (4 bytes) - As signed int32, in centimeters
+            baro_raw = struct.unpack('<i', data[offset:offset+4])[0]
+            parsed['baro_alt'] = baro_raw / 100.0  # Convert to meters
+            offset += 4
+            
+            # BARO_P (4 bytes)
+            parsed['baro_p'] = struct.unpack('<f', data[offset:offset+4])[0]
+            offset += 4
+            
+            # Position (24 bytes)
+            parsed['lat'] = struct.unpack('<d', data[offset:offset+8])[0]
+            parsed['long'] = struct.unpack('<d', data[offset+8:offset+16])[0]
+            parsed['alt'] = struct.unpack('<d', data[offset+16:offset+24])[0]
+            offset += 24
+            
+            # Velocity (12 bytes)
+            parsed['vel_n'] = struct.unpack('<f', data[offset:offset+4])[0]
+            parsed['vel_e'] = struct.unpack('<f', data[offset+4:offset+8])[0]
+            parsed['vel_d'] = struct.unpack('<f', data[offset+8:offset+12])[0]
+            offset += 12
+            
+            # UTC (7 bytes) - Conditional
+            if self.has_utc:
+                parsed['utc_year'] = struct.unpack('<H', data[offset:offset+2])[0]
+                parsed['utc_month'] = data[offset+2]
+                parsed['utc_day'] = data[offset+3]
+                parsed['utc_hour'] = data[offset+4]
+                parsed['utc_minute'] = data[offset+5]
+                parsed['utc_second'] = data[offset+6]
+                offset += 7
+            
+            # Heading (4 bytes)
+            if offset + 4 <= len(data):
+                parsed['heading'] = struct.unpack('<f', data[offset:offset+4])[0]
+                offset += 4
             
             if self.debug:
-                print(f"Parsed {len(parsed)} fields from {offset} bytes")
-                print(f"Available fields: {list(parsed.keys())}")
+                print(f"Parsed {offset}/{len(data)} bytes successfully")
                 
         except Exception as e:
             if self.debug:
                 print(f"Error parsing data: {e}")
-                print(f"Data hex: {data.hex()}")
             return None
         
         return parsed
-    
-    def get_gps_fix_string(self, fix_type):
-        """Convert GPS fix type to string"""
-        fix_types = {
-            0: "NO_FIX",
-            1: "TIME_ONLY",
-            2: "2D_FIX",
-            3: "3D_FIX"
-        }
-        return fix_types.get(fix_type, "UNKNOWN")
     
     def format_log_entry(self, parsed_data):
         """Format parsed data into a log entry"""
@@ -271,53 +245,57 @@ class IMU250Reader:
         
         parts = [timestamp]
         
-        # Euler angles (if available)
+        # Euler angles
         if all(k in parsed_data for k in ['roll', 'pitch', 'yaw']):
-            roll_deg = parsed_data['roll'] * 180.0 / 3.14159265359
-            pitch_deg = parsed_data['pitch'] * 180.0 / 3.14159265359
-            yaw_deg = parsed_data['yaw'] * 180.0 / 3.14159265359
+            roll_deg = parsed_data['roll'] * 57.2957795
+            pitch_deg = parsed_data['pitch'] * 57.2957795
+            yaw_deg = parsed_data['yaw'] * 57.2957795
             parts.append(f"EULER(deg): R={roll_deg:.2f},P={pitch_deg:.2f},Y={yaw_deg:.2f}")
         
-        # Gyroscope (if available)
+        # Gyroscope
         if all(k in parsed_data for k in ['gx', 'gy', 'gz']):
             parts.append(f"GYRO: X={parsed_data['gx']:.3f},Y={parsed_data['gy']:.3f},Z={parsed_data['gz']:.3f}")
         
-        # Accelerometer (if available)
+        # Accelerometer
         if all(k in parsed_data for k in ['ax', 'ay', 'az']):
             parts.append(f"ACCEL: X={parsed_data['ax']:.3f},Y={parsed_data['ay']:.3f},Z={parsed_data['az']:.3f}")
         
-        # Magnetometer (if available)
+        # Magnetometer
         if all(k in parsed_data for k in ['mx', 'my', 'mz']):
             parts.append(f"MAG: X={parsed_data['mx']:.3f},Y={parsed_data['my']:.3f},Z={parsed_data['mz']:.3f}")
         
-        # UTC time (if available)
-        if all(k in parsed_data for k in ['utc_year', 'utc_month', 'utc_day']):
-            parts.append(f"UTC: {parsed_data['utc_year']}-{parsed_data['utc_month']:02d}-{parsed_data['utc_day']:02d} "
-                        f"{parsed_data.get('utc_hour', 0):02d}:{parsed_data.get('utc_minute', 0):02d}:{parsed_data.get('utc_second', 0):02d}")
+        # Temperatures (if present)
+        if 't0' in parsed_data and 't1' in parsed_data:
+            parts.append(f"TEMP: T0={parsed_data['t0']:.2f}°C,T1={parsed_data['t1']:.2f}°C")
         
-        # Magnetic heading (if available)
-        if 'heading' in parsed_data:
-            parts.append(f"MAG_HEADING: {parsed_data['heading']:.2f}°")
-        
-        # Barometric altitude (if available)
+        # Barometric altitude (FIXED!)
         if 'baro_alt' in parsed_data:
-            parts.append(f"BARO_ALT: {parsed_data['baro_alt']/100.0:.2f}m")
+            parts.append(f"BARO_ALT: {parsed_data['baro_alt']:.2f}m")
         
-        # GPS info (if available)
+        # GPS info
         if 'gps_fix_string' in parsed_data:
             parts.append(f"GPS: {parsed_data['gps_fix_string']},SAT={parsed_data.get('num_sv', 0)}")
             if 'iTOW' in parsed_data:
                 parts.append(f"iTOW={parsed_data['iTOW']}ms")
         
-        # Position (if available)
+        # Position
         if all(k in parsed_data for k in ['lat', 'long']):
             parts.append(f"POS: LAT={parsed_data['lat']:.6f},LON={parsed_data['long']:.6f}")
             if 'alt' in parsed_data:
                 parts.append(f"ALT={parsed_data['alt']:.2f}m")
         
-        # Velocity (if available)
+        # Velocity
         if all(k in parsed_data for k in ['vel_n', 'vel_e', 'vel_d']):
             parts.append(f"VEL: N={parsed_data['vel_n']:.2f},E={parsed_data['vel_e']:.2f},D={parsed_data['vel_d']:.2f}")
+        
+        # Heading
+        if 'heading' in parsed_data:
+            parts.append(f"HEADING: {parsed_data['heading']:.2f}°")
+        
+        # UTC (if present)
+        if all(k in parsed_data for k in ['utc_year', 'utc_month', 'utc_day']):
+            parts.append(f"UTC: {parsed_data['utc_year']}-{parsed_data['utc_month']:02d}-{parsed_data['utc_day']:02d} "
+                        f"{parsed_data.get('utc_hour', 0):02d}:{parsed_data.get('utc_minute', 0):02d}:{parsed_data.get('utc_second', 0):02d}")
         
         return ",".join(parts)
     
@@ -334,18 +312,18 @@ class IMU250Reader:
         
         while self.running:
             try:
-                frame_data, data_length = self.read_frame()
+                frame_data = self.read_frame()
                 if frame_data:
-                    parsed_data = self.parse_data_flexible(frame_data, data_length)
+                    parsed_data = self.parse_data(frame_data)
                     if parsed_data:
                         log_entry = self.format_log_entry(parsed_data)
                         self.data_buffer.append(log_entry)
                         frame_count += 1
                         
-                        # Clear line and print
-                        print(f"\rFrames: {frame_count}, Errors: {error_count}, Len: {data_length} | {log_entry[:80]}...", end='', flush=True)
+                        # Print status
+                        print(f"\rFrames: {frame_count}, Errors: {error_count} | {log_entry[:100]}...", end='', flush=True)
                         
-                        # Write to file periodically (every 100 entries)
+                        # Write to file periodically
                         if len(self.data_buffer) % 100 == 0:
                             self.write_log()
                     else:
@@ -369,7 +347,6 @@ class IMU250Reader:
         self.thread.start()
         
         print("IMU reader started. Press Ctrl+C to stop.")
-        print("Press 'd' + Enter to toggle debug mode")
         return True
     
     def stop(self):
@@ -383,16 +360,10 @@ class IMU250Reader:
         self.write_log()
         self.disconnect()
         print(f"Data saved to {self.log_file}")
-    
-    def toggle_debug(self):
-        """Toggle debug mode"""
-        self.debug = not self.debug
-        print(f"\nDebug mode: {'ON' if self.debug else 'OFF'}")
 
 def main():
-    reader = IMU250Reader('config.ini')
+    reader = FlexibleIMUReader('config.ini')
     
-    # Check if we need to run in debug mode
     import sys
     if len(sys.argv) > 1 and sys.argv[1] == '--debug':
         reader.debug = True
@@ -404,52 +375,6 @@ def main():
                 time.sleep(0.1)
     except KeyboardInterrupt:
         reader.stop()
-
-def parse_data_flexible(self, data, data_length):
-    """Parse data flexibly based on actual length"""
-    parsed = {}
-    offset = 0
-    
-    # Add debug output to see byte positions
-    if self.debug:
-        print(f"\n=== PARSING {data_length} BYTES ===")
-        print(f"Raw hex: {data.hex()}")
-    
-    try:
-        for field_name, field_size, field_type in self.field_definitions:
-            if offset + field_size > data_length:
-                break
-            
-            # Debug: show what we're reading
-            if self.debug:
-                chunk = data[offset:offset+field_size]
-                print(f"Offset {offset:3d}: {field_name:12s} ({field_size} bytes) = {chunk.hex()}")
-            
-            if field_type == 'raw':
-                if field_name == 'utc':
-                    utc_data = data[offset:offset+field_size]
-                    parsed['utc_year'] = struct.unpack('<H', utc_data[0:2])[0]
-                    parsed['utc_month'] = utc_data[2]
-                    parsed['utc_day'] = utc_data[3]
-                    parsed['utc_hour'] = utc_data[4]
-                    parsed['utc_minute'] = utc_data[5]
-                    parsed['utc_second'] = utc_data[6]
-                else:
-                    parsed[field_name] = data[offset:offset+field_size]
-            else:
-                value = struct.unpack(f'<{field_type}', data[offset:offset+field_size])[0]
-                parsed[field_name] = value
-                
-                # Debug: show parsed value
-                if self.debug:
-                    print(f"         -> Value: {value}")
-            
-            offset += field_size
-        
-        # Specific debug for barometric altitude
-        if 'baro_alt' in parsed and self.debug:
-            print(f"\n!!! BARO_ALT raw value: {parsed['baro_alt']}")
-            print(f"!!! BARO_ALT converted: {parsed['baro_alt']/100.0:.2f}m")
 
 if __name__ == "__main__":
     main()
