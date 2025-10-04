@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 #!/usr/bin/env python3
 import serial
 import struct
@@ -429,5 +428,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-=======
->>>>>>> e9a4d933daed8e167a3e3d0e1222691916cfd146
