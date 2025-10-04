@@ -152,27 +152,59 @@ class MagneticTracker:
     def start(self):
         """Start the magnetic tracker"""
         print("Starting Magnetic Heading Tracker...")
-        print(f"Target Tilt: {self.target_tilt}°")
-        print(f"Heading Offset: {self.heading_offset}°")
-        print(f"Dead Zone: {self.dead_zone}°")
+        print(f"Target Tilt: {self.target_tilt}�")
+        print(f"Heading Offset: {self.heading_offset}�")
+        print(f"Dead Zone: {self.dead_zone}�")
         print(f"Update Rate: {self.update_rate} Hz")
         print("-" * 80)
         
-        # Override IMU reader's format_log_entry to capture data
-        original_format = self.imu_reader.format_log_entry
+        # Store reference to self for use in closure
+        tracker_self = self
         
-        def new_format(parsed_data):
-            self.imu_data_callback(parsed_data)
-            return original_format(parsed_data)
+        # Override the reading thread method entirely
+        original_reading_thread = self.imu_reader.reading_thread
         
-        self.imu_reader.format_log_entry = new_format
+        def new_reading_thread():
+            frame_count = 0
+            error_count = 0
+            
+            while tracker_self.imu_reader.running:
+                try:
+                    frame_data = tracker_self.imu_reader.read_frame()
+                    if frame_data:
+                        parsed_data = tracker_self.imu_reader.parse_data(frame_data)
+                        if parsed_data:
+                            # Send data to tracker
+                            tracker_self.imu_data_callback(parsed_data)
+                            
+                            # Continue with normal IMU processing
+                            log_entry = tracker_self.imu_reader.format_log_entry(parsed_data)
+                            tracker_self.imu_reader.data_buffer.append(log_entry)
+                            frame_count += 1
+                            
+                            # Print normally
+                            print(f"\rFrames: {frame_count}, Errors: {error_count} | {log_entry[:100]}...", end='', flush=True)
+                            
+                            if len(tracker_self.imu_reader.data_buffer) % 100 == 0:
+                                tracker_self.imu_reader.write_log()
+                    else:
+                        error_count += 1
+                    
+                except Exception as e:
+                    error_count += 1
+                    if tracker_self.imu_reader.debug:
+                        print(f"\nError in reading thread: {e}")
+                    time.sleep(0.01)
         
-        # Start IMU reader
+        # Replace the method
+        self.imu_reader.reading_thread = new_reading_thread
+        
+        # NOW start IMU reader
         if not self.imu_reader.start():
             print("Failed to start IMU reader")
             return False
         
-        # Home the PTZ (optional - set to a known position)
+        # Home the PTZ
         print("Homing PTZ...")
         self.ptz_controller.stop()
         time.sleep(1)

@@ -51,6 +51,6 @@ def keyboard_control(controller):
         listener.join()
 
 if __name__ == "__main__":
-    controller = SP2520Controller(port='/dev/ttyUSB0', baudrate=2400, address=1)
+    controller = SP2520Controller()
     print("Controls: WASD=Move, Q/E=Speed, 1-9=Presets, ESC=Exit")
     keyboard_control(controller)
